@@ -10,7 +10,7 @@ if (GGML_ALL_WARNINGS)
       add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:${cxx_flags}>")
   endif()
 endif()
-
+include_directories("./include")
 add_library(common STATIC common.cpp)
 target_include_directories(common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -19,7 +19,7 @@ target_link_libraries(common-ggml PRIVATE ggml)
 target_include_directories(common-ggml PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_subdirectory(yolo)
-
+add_subdirectory(demo)
 if (NOT GGML_BACKEND_DL)
     add_subdirectory(gpt-2)
     add_subdirectory(gpt-j)

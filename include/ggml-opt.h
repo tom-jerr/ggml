@@ -250,6 +250,22 @@ extern "C" {
             float                           val_split,      // fraction of the dataset to use for validation, must be in [0.0f, 1.0f)
             bool                            silent);        // whether or not info prints to stderr should be suppressed
 
+    // Convenience wrapper around ggml_opt_fit for the single-backend case:
+    // creates a temporary backend scheduler that uses only `backend` (which must be a CPU backend).
+    GGML_API void ggml_opt_fit_backend(
+            ggml_backend_t                  backend,        // backend used to construct the compute graphs (must be a CPU backend)
+            struct ggml_context           * ctx_compute,    // context with temporarily allocated tensors to calculate the outputs
+            struct ggml_tensor            * inputs,         // input tensor with shape [ne_datapoint, ndata_batch]
+            struct ggml_tensor            * outputs,        // output tensor, must have shape [ne_label, ndata_batch] if labels are used
+            ggml_opt_dataset_t              dataset,        // dataset with data and optionally also labels
+            enum ggml_opt_loss_type         loss_type,      // loss to minimize
+            enum ggml_opt_optimizer_type    optimizer,      // sgd or adamw
+            ggml_opt_get_optimizer_params   get_opt_pars,   // callback to get optimizer params, userdata is pointer to epoch (of type int64_t)
+            int64_t                         nepoch,         // how many times the dataset should be iterated over
+            int64_t                         nbatch_logical, // datapoints optimizer step, must be a multiple of ndata_batch in inputs/outputs
+            float                           val_split,      // fraction of the dataset to use for validation, must be in [0.0f, 1.0f)
+            bool                            silent);        // whether or not info prints to stderr should be suppressed
+
 
 #ifdef  __cplusplus
 }

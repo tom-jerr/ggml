@@ -120,7 +120,7 @@ ggml_opt_dataset_t ggml_opt_dataset_init(
     }
 
     result->buf = ggml_backend_alloc_ctx_tensors_from_buft(result->ctx, ggml_backend_cpu_buffer_type());
-
+    // 数据训练时按 shard shuffle
     const int64_t nshards = ndata/ndata_shard;
     result->permutation.resize(nshards);
     for (int64_t i = 0; i < nshards; ++i) {
@@ -1075,6 +1075,46 @@ void ggml_opt_fit(
     ggml_opt_free(opt_ctx);
     ggml_opt_result_free(result_train);
     ggml_opt_result_free(result_val);
+}
+
+void ggml_opt_fit_backend(
+        ggml_backend_t                 backend,
+        ggml_context                 * ctx_compute,
+        ggml_tensor                  * inputs,
+        ggml_tensor                  * outputs,
+        ggml_opt_dataset_t             dataset,
+        enum ggml_opt_loss_type        loss_type,
+        enum ggml_opt_optimizer_type   optimizer,
+        ggml_opt_get_optimizer_params  get_opt_pars,
+        int64_t                        nepoch,
+        int64_t                        nbatch_logical,
+        float                          val_split,
+        bool                           silent) {
+    GGML_ASSERT(backend);
+
+    const bool backend_is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    GGML_ASSERT(backend_is_cpu && "ggml_opt_fit_backend requires a CPU backend; use ggml_opt_fit with a scheduler for non-CPU backends");
+
+    ggml_backend_t backends[1] = { backend };
+    ggml_backend_sched_t backend_sched =
+        ggml_backend_sched_new(backends, /*bufts =*/ nullptr, /*n_backends =*/ 1, GGML_DEFAULT_GRAPH_SIZE, /*parallel =*/ false, /*op_offload =*/ true);
+    GGML_ASSERT(backend_sched);
+
+    ggml_opt_fit(
+            backend_sched,
+            ctx_compute,
+            inputs,
+            outputs,
+            dataset,
+            loss_type,
+            optimizer,
+            get_opt_pars,
+            nepoch,
+            nbatch_logical,
+            val_split,
+            silent);
+
+    ggml_backend_sched_free(backend_sched);
 }
 
 enum ggml_opt_optimizer_type ggml_opt_context_optimizer_type(ggml_opt_context_t c) {

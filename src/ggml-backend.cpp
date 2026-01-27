@@ -698,7 +698,9 @@ struct ggml_backend_sched {
     int * node_backend_ids; // [graph_size]
     int * leaf_backend_ids; // [graph_size]
 
-    int * prev_node_backend_ids; // [graph_size]
+    // 用于 gallocr 减少 plan 的成本
+    // 如果 node 和 leaf 的 backend id 没有变化，则不需要重新分配
+    int * prev_node_backend_ids; // [graph_size] 
     int * prev_leaf_backend_ids; // [graph_size]
 
     // copy of the graph with modified inputs

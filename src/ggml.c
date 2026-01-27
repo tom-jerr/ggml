@@ -4507,6 +4507,7 @@ GGML_API struct ggml_tensor * ggml_conv_transpose_1d(
 // a: [OC，IC, KH, KW]
 // b: [N, IC, IH, IW]
 // result: [N, OC, OH, OW]
+// 将每个卷积核的感受野拉成一列，变成了两个矩阵的点积
 struct ggml_tensor * ggml_conv_2d(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,

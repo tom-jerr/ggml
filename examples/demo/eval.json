@@ -1,0 +1,8 @@
+{
+  "model_name": "mnist-cnn",
+  "model_file": "models/mnist-cnn-f32.gguf",
+
+  "eval_images": "data/MNIST/raw/t10k-images-idx3-ubyte",
+  "eval_labels": "data/MNIST/raw/t10k-labels-idx1-ubyte"
+}
+
