@@ -1,5 +1,7 @@
 #include "model.h"
 #include "ggml-backend.h"
+#include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <ggml-opt.h>
 #include <spdlog/spdlog.h>
@@ -58,131 +60,205 @@ bool load_from_gguf(const char *fname, struct ggml_context *ctx_ggml,
 
 MnistCNN::MnistCNN(const std::string &model_file, const int nbatch_logical,
                    const int nbatch_physical)
-    : nbatch_logical(nbatch_logical), nbatch_physical(nbatch_physical) {
+    : model_file(model_file), nbatch_logical(nbatch_logical),
+      nbatch_physical(nbatch_physical) {
 
   const int ncores_logical = std::thread::hardware_concurrency();
   const int nthreads = std::min(ncores_logical, (ncores_logical + 4) / 2);
 
-  // just use CPU backend for this demo
-  backend_cpu =
-      ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+  init_backends();
   ggml_backend_cpu_set_n_threads(backend_cpu, nthreads);
 
-  {
-    const size_t size_meta = 1024 * ggml_tensor_overhead();
-    struct ggml_init_params params = {
-        /*.mem_size   =*/size_meta,
-        /*.mem_buffer =*/nullptr,
-        /*.no_alloc   =*/true,
-    };
-    ctx_static = ggml_init(params);
-  }
+  const size_t size_meta = 1024 * ggml_tensor_overhead() +
+                           GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() +
+                           3 * ggml_graph_overhead();
+  struct ggml_init_params params = {
+      /*.mem_size   =*/size_meta,
+      /*.mem_buffer =*/nullptr,
+      /*.no_alloc   =*/true,
+  };
+  ctx_compute = ggml_init(params);
 
-  {
-    // The compute context needs a total of 3 compute graphs: forward pass +
-    // backwards pass (with/without optimizer step).
-    const size_t size_meta = GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() +
-                             3 * ggml_graph_overhead();
-    struct ggml_init_params params = {
-        /*.mem_size   =*/size_meta,
-        /*.mem_buffer =*/nullptr,
-        /*.no_alloc   =*/true,
-    };
-    ctx_compute = ggml_init(params);
-  }
-  if (!model_file.empty()) {
-    init_from_file(model_file);
-  } else {
-    init_random();
-  }
-  init_input();
+  init_input();   // load images as input
+  init_weights(); // load or initialize weights
 }
 
 MnistCNN::~MnistCNN() {
   ggml_free(ctx_gguf);
-  ggml_free(ctx_static);
   ggml_free(ctx_compute);
 
-  ggml_backend_buffer_free(buf_gguf);
-  ggml_backend_buffer_free(buf_static);
+  ggml_backend_buffer_free(buf_weights_gpu);
+  ggml_backend_buffer_free(buf_weights_cpu);
+
+  ggml_backend_free(backend_gpu);
   ggml_backend_free(backend_cpu);
 }
 
+void MnistCNN::init_backends() {
+  ggml_backend_load_all();
+
+  backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+  if (!backend_cpu) {
+    GGML_ABORT("failed to init CPU backend");
+  }
+
+  backend_gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+  if (backend_gpu) {
+    spdlog::info("backend: GPU available: {}", ggml_backend_name(backend_gpu));
+  } else {
+    spdlog::warn("backend: GPU backend not available, falling back to CPU only");
+  }
+}
+
+void MnistCNN::ensure_sched_debug_env() const {
+  // Scheduler prints splits/assignments via GGML_LOG_DEBUG when this env var is set.
+  if (std::getenv("GGML_SCHED_DEBUG") == nullptr) {
+    setenv("GGML_SCHED_DEBUG", "2", /*overwrite =*/0);
+  }
+}
+
+void MnistCNN::alloc_weights_split(bool enable_gpu_conv) {
+  GGML_ASSERT(conv1_kernel && conv1_bias && conv2_kernel && conv2_bias);
+  GGML_ASSERT(dense_weight && dense_bias);
+
+  // Free previous buffers if re-initializing.
+  ggml_backend_buffer_free(buf_weights_gpu);
+  ggml_backend_buffer_free(buf_weights_cpu);
+  buf_weights_gpu = nullptr;
+  buf_weights_cpu = nullptr;
+
+  const bool use_gpu_for_conv = enable_gpu_conv && backend_gpu != nullptr;
+
+  std::vector<ggml_tensor *> w_conv = {conv1_kernel, conv1_bias, conv2_kernel, conv2_bias};
+  std::vector<ggml_tensor *> w_dense = {dense_weight, dense_bias};
+
+  size_t size_gpu = 0;
+  size_t size_cpu = 0;
+
+  auto add_size = [](size_t &acc, ggml_tensor *t) { acc += ggml_nbytes(t) + 512; };
+
+  if (use_gpu_for_conv) {
+    for (ggml_tensor *t : w_conv) {
+      add_size(size_gpu, t);
+    }
+    for (ggml_tensor *t : w_dense) {
+      add_size(size_cpu, t);
+    }
+  } else {
+    for (ggml_tensor *t : w_conv) {
+      add_size(size_cpu, t);
+    }
+    for (ggml_tensor *t : w_dense) {
+      add_size(size_cpu, t);
+    }
+  }
+
+  if (size_gpu > 0) {
+    buf_weights_gpu = ggml_backend_alloc_buffer(backend_gpu, size_gpu);
+    GGML_ASSERT(buf_weights_gpu);
+    ggml_backend_buffer_set_usage(buf_weights_gpu,
+                                 GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+  }
+  if (size_cpu > 0) {
+    buf_weights_cpu = ggml_backend_alloc_buffer(backend_cpu, size_cpu);
+    GGML_ASSERT(buf_weights_cpu);
+    ggml_backend_buffer_set_usage(buf_weights_cpu,
+                                 GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+  }
+
+  if (use_gpu_for_conv) {
+    ggml_tallocr alloc_gpu = ggml_tallocr_new(buf_weights_gpu);
+    for (ggml_tensor *t : w_conv) {
+      const enum ggml_status st = ggml_tallocr_alloc(&alloc_gpu, t);
+      GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+    }
+
+    ggml_tallocr alloc_cpu = ggml_tallocr_new(buf_weights_cpu);
+    for (ggml_tensor *t : w_dense) {
+      const enum ggml_status st = ggml_tallocr_alloc(&alloc_cpu, t);
+      GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+    }
+  } else {
+    ggml_tallocr alloc_cpu = ggml_tallocr_new(buf_weights_cpu);
+    for (ggml_tensor *t : w_conv) {
+      const enum ggml_status st = ggml_tallocr_alloc(&alloc_cpu, t);
+      GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+    }
+    for (ggml_tensor *t : w_dense) {
+      const enum ggml_status st = ggml_tallocr_alloc(&alloc_cpu, t);
+      GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+    }
+  }
+
+  log_weight_placement();
+}
+
+void MnistCNN::log_weight_placement() const {
+  auto log_w = [&](ggml_tensor *t) {
+    const char *buf_name = t->buffer ? ggml_backend_buffer_name(t->buffer) : "NULL";
+    const char *where = "UNALLOC";
+    if (t->buffer == buf_weights_gpu) {
+      where = backend_gpu ? ggml_backend_name(backend_gpu) : "GPU(NULL)";
+    } else if (t->buffer == buf_weights_cpu) {
+      where = backend_cpu ? ggml_backend_name(backend_cpu) : "CPU(NULL)";
+    }
+    spdlog::info("weight placement: {:<14} -> {:<8} buffer={} bytes={}",
+                 t->name, where, buf_name, ggml_nbytes(t));
+  };
+
+  log_w(conv1_kernel);
+  log_w(conv1_bias);
+  log_w(conv2_kernel);
+  log_w(conv2_bias);
+  log_w(dense_weight);
+  log_w(dense_bias);
+}
+
 bool MnistCNN::init_input() {
-  images = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, MNIST_NINPUT,
+  images = ggml_new_tensor_2d(ctx_compute, GGML_TYPE_F32, MNIST_NINPUT,
                               nbatch_physical);
-
-  ggml_set_name(images, "images");
-  ggml_set_input(images);
-
-  buf_static = ggml_backend_alloc_ctx_tensors(ctx_static, backend_cpu);
   spdlog::info("Successfully initialized input tensor");
   return true;
 }
 
-bool MnistCNN::init_from_file(const std::string &fname) {
-  struct gguf_context *ctx;
-  {
-    struct gguf_init_params params = {
-        /*.no_alloc   =*/true,
-        /*.ctx        =*/&this->ctx_gguf,
-    };
-    ctx = gguf_init_from_file(fname.c_str(), params);
-    if (!ctx) {
-      spdlog::error("failed to load model from file: {}", fname);
-      return false;
-    }
+bool MnistCNN::init_weights() {
+  if (!model_file.empty()) {
+    return init_from_file();
+  } else {
+    return init_random();
   }
-  // Allocate tensor metadata in ctx_gguf
-  this->conv1_kernel = ggml_get_tensor(this->ctx_gguf, "conv1.kernel");
-  GGML_ASSERT(this->conv1_kernel->type == GGML_TYPE_F32);
-  GGML_ASSERT(this->conv1_kernel->ne[0] == 3);
-  GGML_ASSERT(this->conv1_kernel->ne[1] == 3);
-  GGML_ASSERT(this->conv1_kernel->ne[2] == 1);
-  GGML_ASSERT(this->conv1_kernel->ne[3] == MNIST_CNN_NCB);
-  this->conv1_bias = ggml_get_tensor(this->ctx_gguf, "conv1.bias");
-  GGML_ASSERT(this->conv1_bias->type == GGML_TYPE_F32);
-  GGML_ASSERT(this->conv1_bias->ne[0] == 1);
-  GGML_ASSERT(this->conv1_bias->ne[1] == 1);
-  GGML_ASSERT(this->conv1_bias->ne[2] == MNIST_CNN_NCB);
-  GGML_ASSERT(this->conv1_bias->ne[3] == 1);
+}
 
-  this->conv2_kernel = ggml_get_tensor(this->ctx_gguf, "conv2.kernel");
-  GGML_ASSERT(this->conv2_kernel->type == GGML_TYPE_F32);
-  GGML_ASSERT(this->conv2_kernel->ne[0] == 3);
-  GGML_ASSERT(this->conv2_kernel->ne[1] == 3);
-  GGML_ASSERT(this->conv2_kernel->ne[2] == MNIST_CNN_NCB);
-  GGML_ASSERT(this->conv2_kernel->ne[3] == MNIST_CNN_NCB * 2);
+bool MnistCNN::init_from_file() {
+  struct gguf_context *ctx;
 
-  this->conv2_bias = ggml_get_tensor(this->ctx_gguf, "conv2.bias");
-  GGML_ASSERT(this->conv2_bias->type == GGML_TYPE_F32);
-  GGML_ASSERT(this->conv2_bias->ne[0] == 1);
-  GGML_ASSERT(this->conv2_bias->ne[1] == 1);
-  GGML_ASSERT(this->conv2_bias->ne[2] == MNIST_CNN_NCB * 2);
-  GGML_ASSERT(this->conv2_bias->ne[3] == 1);
-
-  this->dense_weight = ggml_get_tensor(this->ctx_gguf, "dense.weight");
-  GGML_ASSERT(this->dense_weight->type == GGML_TYPE_F32);
-  GGML_ASSERT(this->dense_weight->ne[0] ==
-              (MNIST_HW / 4) * (MNIST_HW / 4) * (MNIST_CNN_NCB * 2));
-  GGML_ASSERT(this->dense_weight->ne[1] == MNIST_NCLASSES);
-  GGML_ASSERT(this->dense_weight->ne[2] == 1);
-  GGML_ASSERT(this->dense_weight->ne[3] == 1);
-
-  this->dense_bias = ggml_get_tensor(this->ctx_gguf, "dense.bias");
-  GGML_ASSERT(this->dense_bias->type == GGML_TYPE_F32);
-  GGML_ASSERT(this->dense_bias->ne[0] == MNIST_NCLASSES);
-  GGML_ASSERT(this->dense_bias->ne[1] == 1);
-  GGML_ASSERT(this->dense_bias->ne[2] == 1);
-  GGML_ASSERT(this->dense_bias->ne[3] == 1);
-  // Load weights
-  this->buf_gguf =
-      ggml_backend_alloc_ctx_tensors(this->ctx_gguf, this->backend_cpu);
-  if (!load_from_gguf(fname.c_str(), this->ctx_gguf, ctx)) {
-    spdlog::error("loading weights from {} failed", fname);
+  struct gguf_init_params params = {
+      /*.no_alloc   =*/true,
+      /*.ctx        =*/&this->ctx_gguf,
+  };
+  ctx = gguf_init_from_file(this->model_file.c_str(), params);
+  if (!ctx) {
+    spdlog::error("failed to load model from file: {}", this->model_file);
     return false;
   }
-  spdlog::info("Successfully loaded weights from {}", fname);
+
+  // Allocate tensor metadata in ctx_gguf
+  this->conv1_kernel = ggml_get_tensor(this->ctx_gguf, "conv1.kernel");
+  this->conv1_bias = ggml_get_tensor(this->ctx_gguf, "conv1.bias");
+  this->conv2_kernel = ggml_get_tensor(this->ctx_gguf, "conv2.kernel");
+  this->conv2_bias = ggml_get_tensor(this->ctx_gguf, "conv2.bias");
+  this->dense_weight = ggml_get_tensor(this->ctx_gguf, "dense.weight");
+  this->dense_bias = ggml_get_tensor(this->ctx_gguf, "dense.bias");
+
+  // Allocate persistent weight storage (conv on GPU, dense on CPU when possible).
+  alloc_weights_split(/*enable_gpu_conv =*/true);
+
+  // Load weights
+  if (!load_from_gguf(this->model_file.c_str(), this->ctx_gguf, ctx)) {
+    spdlog::error("loading weights from {} failed", this->model_file);
+    return false;
+  }
+  spdlog::info("Successfully loaded weights from {}", this->model_file);
   return true;
 }
 
@@ -191,19 +267,19 @@ bool MnistCNN::init_random() {
   std::mt19937 gen{rd()};
   std::normal_distribution<float> nd{0.0f, 1e-2f};
   std::vector<ggml_tensor *> init_tensors;
-  this->conv1_kernel = ggml_new_tensor_4d(this->ctx_static, GGML_TYPE_F32, 3, 3,
-                                          1, MNIST_CNN_NCB);
+  this->conv1_kernel = ggml_new_tensor_4d(this->ctx_compute, GGML_TYPE_F32, 3,
+                                          3, 1, MNIST_CNN_NCB);
   this->conv1_bias =
-      ggml_new_tensor_3d(this->ctx_static, GGML_TYPE_F32, 1, 1, MNIST_CNN_NCB);
-  this->conv2_kernel = ggml_new_tensor_4d(this->ctx_static, GGML_TYPE_F32, 3, 3,
-                                          MNIST_CNN_NCB, MNIST_CNN_NCB * 2);
-  this->conv2_bias = ggml_new_tensor_3d(this->ctx_static, GGML_TYPE_F32, 1, 1,
+      ggml_new_tensor_3d(this->ctx_compute, GGML_TYPE_F32, 1, 1, MNIST_CNN_NCB);
+  this->conv2_kernel = ggml_new_tensor_4d(this->ctx_compute, GGML_TYPE_F32, 3,
+                                          3, MNIST_CNN_NCB, MNIST_CNN_NCB * 2);
+  this->conv2_bias = ggml_new_tensor_3d(this->ctx_compute, GGML_TYPE_F32, 1, 1,
                                         MNIST_CNN_NCB * 2);
   this->dense_weight = ggml_new_tensor_2d(
-      this->ctx_static, GGML_TYPE_F32,
+      this->ctx_compute, GGML_TYPE_F32,
       (MNIST_HW / 4) * (MNIST_HW / 4) * (MNIST_CNN_NCB * 2), MNIST_NCLASSES);
   this->dense_bias =
-      ggml_new_tensor_1d(this->ctx_static, GGML_TYPE_F32, MNIST_NCLASSES);
+      ggml_new_tensor_1d(this->ctx_compute, GGML_TYPE_F32, MNIST_NCLASSES);
 
   ggml_set_name(this->conv1_kernel, "conv1.kernel");
   ggml_set_name(this->conv1_bias, "conv1.bias");
@@ -219,9 +295,8 @@ bool MnistCNN::init_random() {
   init_tensors.push_back(this->dense_weight);
   init_tensors.push_back(this->dense_bias);
 
-  // Set allocator
-  this->buf_static =
-      ggml_backend_alloc_ctx_tensors(this->ctx_static, this->backend_cpu);
+  // Allocate persistent weight storage (conv on GPU, dense on CPU when possible).
+  alloc_weights_split(/*enable_gpu_conv =*/true);
 
   for (ggml_tensor *t : init_tensors) {
     GGML_ASSERT(t->type == GGML_TYPE_F32);
@@ -278,40 +353,27 @@ bool MnistCNN::load_dataset(const std::string &image_fname,
   return true;
 }
 
-void MnistCNN::build(ggml_opt_dataset_t dataset) {
+void MnistCNN::build_compute_graph() {
   // build model computation graph here
-  ggml_set_param(this->conv1_kernel);
-  ggml_set_param(this->conv1_bias);
-  ggml_set_param(this->conv2_kernel);
-  ggml_set_param(this->conv2_bias);
-  ggml_set_param(this->dense_weight);
-  ggml_set_param(this->dense_bias);
-
   struct ggml_tensor *images_2D =
       ggml_reshape_4d(this->ctx_compute, this->images, MNIST_HW, MNIST_HW, 1,
                       this->images->ne[1]);
+  ggml_set_name(images_2D, "images_2d");
 
   // conv2d params: stride_h, stride_w, pad_h, pad_w, dilation_w, dilation_h
+  // shape [H, W, C, B] -> (conv) -> shape [H, W, NCB, B]
   struct ggml_tensor *conv1_out =
       ggml_relu(this->ctx_compute,
                 ggml_add(this->ctx_compute,
                          ggml_conv_2d(this->ctx_compute, this->conv1_kernel,
                                       images_2D, 1, 1, 1, 1, 1, 1),
                          this->conv1_bias));
-
-  // shape [H, W, C, B] -> (conv) -> shape [H, W, NCB, B]
-  GGML_ASSERT(conv1_out->ne[0] == MNIST_HW);
-  GGML_ASSERT(conv1_out->ne[1] == MNIST_HW);
-  GGML_ASSERT(conv1_out->ne[2] == MNIST_CNN_NCB);
-  GGML_ASSERT(conv1_out->ne[3] == this->nbatch_physical);
+  ggml_set_name(conv1_out, "conv1_out");
 
   // shape [H, W, NCB, B] -> (maxpool) -> shape [H/2, W/2, NCB, B]
   struct ggml_tensor *conv2_in = ggml_pool_2d(
       this->ctx_compute, conv1_out, GGML_OP_POOL_MAX, 2, 2, 2, 2, 0, 0);
-  GGML_ASSERT(conv2_in->ne[0] == MNIST_HW / 2);
-  GGML_ASSERT(conv2_in->ne[1] == MNIST_HW / 2);
-  GGML_ASSERT(conv2_in->ne[2] == MNIST_CNN_NCB);
-  GGML_ASSERT(conv2_in->ne[3] == this->nbatch_physical);
+  ggml_set_name(conv2_in, "conv2_in");
 
   // shape [H/2, W/2, NCB, B] -> (conv) -> shape [H/2, W/2, NCB*2, B]
   struct ggml_tensor *conv2_out =
@@ -320,18 +382,12 @@ void MnistCNN::build(ggml_opt_dataset_t dataset) {
                          ggml_conv_2d(this->ctx_compute, this->conv2_kernel,
                                       conv2_in, 1, 1, 1, 1, 1, 1),
                          this->conv2_bias));
-  GGML_ASSERT(conv2_out->ne[0] == MNIST_HW / 2);
-  GGML_ASSERT(conv2_out->ne[1] == MNIST_HW / 2);
-  GGML_ASSERT(conv2_out->ne[2] == MNIST_CNN_NCB * 2);
-  GGML_ASSERT(conv2_out->ne[3] == this->nbatch_physical);
+  ggml_set_name(conv2_out, "conv2_out");
 
   // shape [H/2, W/2, NCB*2, B] -> (maxpool) -> shape [H/4, W/4, NCB*2, B]
   struct ggml_tensor *dense_in = ggml_pool_2d(
       this->ctx_compute, conv2_out, GGML_OP_POOL_MAX, 2, 2, 2, 2, 0, 0);
-  GGML_ASSERT(dense_in->ne[0] == MNIST_HW / 4);
-  GGML_ASSERT(dense_in->ne[1] == MNIST_HW / 4);
-  GGML_ASSERT(dense_in->ne[2] == MNIST_CNN_NCB * 2);
-  GGML_ASSERT(dense_in->ne[3] == this->nbatch_physical);
+  ggml_set_name(dense_in, "dense_in_pool");
 
   // shape [H/4, W/4, NCB*2, B] -> (reshape) -> shape [features, B]
   dense_in = ggml_reshape_2d(
@@ -340,11 +396,7 @@ void MnistCNN::build(ggml_opt_dataset_t dataset) {
                 ggml_permute(this->ctx_compute, dense_in, 1, 2, 0, 3)),
       (MNIST_HW / 4) * (MNIST_HW / 4) * (MNIST_CNN_NCB * 2),
       this->nbatch_physical);
-  GGML_ASSERT(dense_in->ne[0] ==
-              (MNIST_HW / 4) * (MNIST_HW / 4) * (MNIST_CNN_NCB * 2));
-  GGML_ASSERT(dense_in->ne[1] == this->nbatch_physical);
-  GGML_ASSERT(dense_in->ne[2] == 1);
-  GGML_ASSERT(dense_in->ne[3] == 1);
+  ggml_set_name(dense_in, "dense_in");
 
   // shape [features, B] -> (fc) -> shape [10, B]
   this->logits =
@@ -352,36 +404,132 @@ void MnistCNN::build(ggml_opt_dataset_t dataset) {
                ggml_mul_mat(this->ctx_compute, this->dense_weight, dense_in),
                this->dense_bias);
 
+  // set input
+  ggml_set_name(this->images, "images");
+  ggml_set_input(this->images);
+  // param means weights that will be optimized during training
+  ggml_set_param(this->conv1_kernel);
+  ggml_set_param(this->conv1_bias);
+  ggml_set_param(this->conv2_kernel);
+  ggml_set_param(this->conv2_bias);
+  ggml_set_param(this->dense_weight);
+  ggml_set_param(this->dense_bias);
+
   ggml_set_name(this->logits, "logits");
   ggml_set_output(this->logits);
-  GGML_ASSERT(this->logits->type == GGML_TYPE_F32);
-  GGML_ASSERT(this->logits->ne[0] == MNIST_NCLASSES);
-  GGML_ASSERT(this->logits->ne[1] == this->nbatch_physical);
-  GGML_ASSERT(this->logits->ne[2] == 1);
-  GGML_ASSERT(this->logits->ne[3] == 1);
 }
 
 void MnistCNN::train(ggml_opt_dataset_t dataset, const int nepoch,
                      const float val_split) {
-  ggml_opt_fit_backend(backend_cpu, ctx_compute, images, logits, dataset,
-                       GGML_OPT_LOSS_TYPE_CROSS_ENTROPY,
-                       GGML_OPT_OPTIMIZER_TYPE_ADAMW,
-                       ggml_opt_get_default_optimizer_params, nepoch,
-                       nbatch_logical, val_split, false);
+  // 计算后面的 pred，需要 dataset 中的 labels 作为 Input
+
+  ensure_sched_debug_env();
+
+  ggml_backend_t backends[2] = {nullptr, nullptr};
+  int n_backends = 0;
+  if (backend_gpu) {
+    backends[n_backends++] = backend_gpu;
+  }
+  backends[n_backends++] = backend_cpu;
+
+  std::string sched_desc;
+  for (int i = 0; i < n_backends; ++i) {
+    if (i) {
+      sched_desc += " -> ";
+    }
+    sched_desc += ggml_backend_name(backends[i]);
+  }
+  spdlog::info("scheduler backends (prio high->low): {}", sched_desc);
+
+  ggml_backend_sched_t backend_sched = ggml_backend_sched_new(
+      backends, /*bufts =*/nullptr, /*n_backends =*/n_backends,
+      GGML_DEFAULT_GRAPH_SIZE,
+      /*parallel =*/false, /*op_offload =*/false);
+
+  ggml_time_init();
+  const int64_t t_start_us = ggml_time_us();
+  const int64_t ndata = ggml_opt_dataset_data(dataset)->ne[1];
+  const int64_t opt_period = nbatch_logical / nbatch_physical;
+  const int64_t nbatches_logical = ndata / nbatch_logical;
+  const int64_t ibatch_split =
+      int64_t(((1.0f - val_split) * nbatches_logical)) *
+      opt_period; // train <-> val split index (physical)
+  const int64_t idata_split = ibatch_split * nbatch_physical;
+
+  int64_t epoch = 1;
+
+  ggml_opt_params params =
+      ggml_opt_default_params(backend_sched, GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
+  params.ctx_compute = ctx_compute;
+  params.inputs = this->images;
+  params.outputs = this->logits;
+  params.opt_period = opt_period;
+  params.get_opt_pars = ggml_opt_get_default_optimizer_params;
+  params.get_opt_pars_ud = &epoch;
+  params.optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+
+  // here we build both forward and backward graphs
+  ggml_opt_context_t opt_ctx = ggml_opt_init(params);
+
+  // Shuffling the data is generally useful but there is only a point if not all
+  // data is used in a single batch.
+  if (nbatch_logical < ndata) {
+    ggml_opt_dataset_shuffle(opt_ctx, dataset,
+                             -1); // Shuffle all data (train + validation).
+  }
+
+  ggml_opt_result_t result_train = ggml_opt_result_init();
+  struct ggml_tensor *inputs = ggml_opt_inputs(opt_ctx);
+  struct ggml_tensor *labels = ggml_opt_labels(opt_ctx);
+  for (; epoch <= nepoch; ++epoch) {
+    if (nbatch_logical < idata_split) {
+      ggml_opt_dataset_shuffle(opt_ctx, dataset, idata_split);
+    }
+
+    ggml_opt_result_reset(result_train);
+    spdlog::info("epoch {}/{}:", epoch, nepoch);
+
+    int64_t t_loop_start = ggml_time_us();
+    int64_t ibatch = 0;
+
+    for (; ibatch < ibatch_split; ++ibatch) {
+      // copy compute graph metadata to a new context, then allocate memory for
+      // tensor data at backend memory
+      ggml_opt_alloc(opt_ctx, /*backward =*/true);
+      // get a batch of data from dataset(images and labels)
+      ggml_opt_dataset_get_batch(dataset, inputs, labels, ibatch);
+      // compute graph and update optimizer
+      ggml_opt_eval(opt_ctx, result_train);
+
+      ggml_opt_epoch_callback_progress_bar(true, opt_ctx, dataset, result_train,
+                                           ibatch + 1, ibatch_split,
+                                           t_loop_start);
+    }
+  }
+
+  int64_t t_total_s = (ggml_time_us() - t_start_us) / 1000000;
+  const int64_t t_total_h = t_total_s / 3600;
+  t_total_s -= t_total_h * 3600;
+  const int64_t t_total_m = t_total_s / 60;
+  t_total_s -= t_total_m * 60;
+  spdlog::info("training completed in {:02}h:{:02}m:{:02}s", t_total_h,
+               t_total_m, t_total_s);
+
+  ggml_opt_free(opt_ctx);
+  ggml_opt_result_free(result_train);
+  ggml_backend_sched_free(backend_sched);
 }
 
 void MnistCNN::save_model(const std::string &fname) {
   spdlog::info("saving model to '{}'", fname);
 
   struct ggml_context *ggml_ctx;
-  {
-    struct ggml_init_params params = {
-        /*.mem_size   =*/100 * 1024 * 1024,
-        /*.mem_buffer =*/NULL,
-        /*.no_alloc   =*/false,
-    };
-    ggml_ctx = ggml_init(params);
-  }
+  struct ggml_init_params params = {
+      /*.mem_size   =*/100 * 1024 * 1024,
+      /*.mem_buffer =*/NULL,
+      /*.no_alloc   =*/false,
+  };
+  ggml_ctx = ggml_init(params);
 
   gguf_context *gguf_ctx = gguf_init_empty();
   gguf_set_val_str(gguf_ctx, "general.architecture", "mnist-cnn");
@@ -401,13 +549,21 @@ void MnistCNN::save_model(const std::string &fname) {
   gguf_free(gguf_ctx);
 }
 
-ggml_opt_result_t MnistCNN::eval(ggml_opt_dataset_t dataset) {
-  ggml_opt_result_t result = ggml_opt_result_init();
+ggml_opt_result_t MnistCNN::eval(const float *image_data, int label) {
 
-  ggml_backend_t backends[1] = {backend_cpu};
+  ensure_sched_debug_env();
+
+  ggml_backend_t backends[2] = {nullptr, nullptr};
+  int n_backends = 0;
+  if (backend_gpu) {
+    backends[n_backends++] = backend_gpu;
+  }
+  backends[n_backends++] = backend_cpu;
+
   ggml_backend_sched_t backend_sched = ggml_backend_sched_new(
-      backends, /*bufts =*/nullptr, /*n_backends =*/1, GGML_DEFAULT_GRAPH_SIZE,
-      /*parallel =*/false, /*op_offload =*/true);
+      backends, /*bufts =*/nullptr, /*n_backends =*/n_backends,
+      GGML_DEFAULT_GRAPH_SIZE,
+      /*parallel =*/false, /*op_offload =*/false);
   ggml_opt_params params =
       ggml_opt_default_params(backend_sched, GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
   params.ctx_compute = ctx_compute;
@@ -416,21 +572,32 @@ ggml_opt_result_t MnistCNN::eval(ggml_opt_dataset_t dataset) {
   params.build_type = GGML_OPT_BUILD_TYPE_FORWARD;
   ggml_opt_context_t opt_ctx = ggml_opt_init(params);
 
-  {
-    const int64_t t_start_us = ggml_time_us();
+  int64_t t_start_us = ggml_time_us();
+  struct ggml_tensor *inputs = ggml_opt_inputs(opt_ctx);
+  struct ggml_tensor *labels_tensor = ggml_opt_labels(opt_ctx);
+  ggml_opt_result_t result = ggml_opt_result_init();
 
-    ggml_opt_epoch(opt_ctx, dataset, nullptr, result, /*idata_split =*/0,
-                   nullptr, nullptr);
+  // 先分配内存，再设置数据
+  ggml_opt_alloc(opt_ctx, /*backward =*/false);
 
-    const int64_t t_total_us = ggml_time_us() - t_start_us;
-    const double t_total_ms = 1e-3 * t_total_us;
-    const int nex = ggml_opt_dataset_data(dataset)->ne[1];
-    spdlog::info(
-        "{}: model evaluation on {} images took {:.2f} ms, {:.2f} us/image",
-        __func__, nex, t_total_ms, (double)t_total_us / nex);
-  }
+  // 设置图像数据
+  ggml_backend_tensor_set(inputs, image_data, 0, MNIST_NINPUT * sizeof(float));
+
+  // 设置 one-hot 标签
+  std::vector<float> label_onehot(MNIST_NCLASSES, 0.0f);
+  label_onehot[label] = 1.0f;
+  ggml_backend_tensor_set(labels_tensor, label_onehot.data(), 0,
+                          MNIST_NCLASSES * sizeof(float));
+
+  ggml_opt_eval(opt_ctx, result);
+
+  const int64_t t_total_us = ggml_time_us() - t_start_us;
+  const double t_total_ms = 1e-3 * t_total_us;
+
+  spdlog::info("eval: sample evaluated in {:.2f} ms", t_total_ms);
 
   ggml_opt_free(opt_ctx);
+  ggml_backend_sched_free(backend_sched);
 
   return result;
 }

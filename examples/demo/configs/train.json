@@ -5,9 +5,6 @@
   "train_images": "data/MNIST/raw/train-images-idx3-ubyte",
   "train_labels": "data/MNIST/raw/train-labels-idx1-ubyte",
 
-  "eval_images": "data/MNIST/raw/t10k-images-idx3-ubyte",
-  "eval_labels": "data/MNIST/raw/t10k-labels-idx1-ubyte",
-
-  "nepoch": 10,
+  "nepoch": 3,
   "val_split": 0.1
 }

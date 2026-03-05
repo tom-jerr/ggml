@@ -63,10 +63,6 @@ int main(int argc, char **argv) {
       "train_images", "data/MNIST/raw/train-images-idx3-ubyte");
   const std::string train_labels = cfg.value<std::string>(
       "train_labels", "data/MNIST/raw/train-labels-idx1-ubyte");
-  const std::string eval_images = cfg.value<std::string>(
-      "eval_images", "data/MNIST/raw/t10k-images-idx3-ubyte");
-  const std::string eval_labels = cfg.value<std::string>(
-      "eval_labels", "data/MNIST/raw/t10k-labels-idx1-ubyte");
 
   const int nepoch = cfg.value<int>("nepoch", 5);
   const float val_split = cfg.value<float>("val_split", 0.05f);
@@ -91,8 +87,6 @@ int main(int argc, char **argv) {
   spdlog::info("output_model: {}", out_path.string());
   spdlog::info("train_images: {}", train_images);
   spdlog::info("train_labels: {}", train_labels);
-  spdlog::info("eval_images:  {}", eval_images);
-  spdlog::info("eval_labels:  {}", eval_labels);
   spdlog::info("nepoch: {}, val_split: {:.3f}", nepoch, (double)val_split);
 
   ggml_time_init();
@@ -109,7 +103,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  model.build(train_ds);
+  model.build_compute_graph();
   model.train(train_ds, nepoch, val_split);
   model.save_model(out_path.string());
   spdlog::info("Training completed and model saved.");
